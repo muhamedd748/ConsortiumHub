@@ -1305,6 +1305,21 @@ $total_budget_preview_pages = ceil($total_budget_preview_records / $records_per_
                                 required
                             >
                         </div>
+
+                        <!-- New: Forecast input on Add Budget Data -->
+                        <div class="mb-4">
+                            <label class="block text-gray-700 font-medium mb-2" for="forecast_add">
+                                <i class="fas fa-chart-line mr-2"></i>Forecast
+                            </label>
+                            <input 
+                                type="number" 
+                                step="0.01"
+                                id="forecast_add" 
+                                name="forecast" 
+                                class="form-input"
+                                placeholder="Optional"
+                            >
+                        </div>
                         
                         <div class="mb-4">
                             <label class="block text-gray-700 font-medium mb-2" for="quarter_number_add">
@@ -1537,24 +1552,25 @@ $total_budget_preview_pages = ceil($total_budget_preview_records / $records_per_
                         </select>
                     </div>
 
-                    <!-- View-only Fields -->
+                    <!-- View/Computed Fields -->
                     <div class="mb-4">
                         <label class="block text-gray-700 font-medium mb-2">
                             <i class="fas fa-key mr-2"></i>ID
                         </label>
                         <input type="text" id="edit_budget_data_view_id" class="form-input bg-gray-100" readonly>
                     </div>
+                    <!-- New: Make Actual and Forecast editable in Edit modal -->
                     <div class="mb-4">
-                        <label class="block text-gray-700 font-medium mb-2">
+                        <label class="block text-gray-700 font-medium mb-2" for="edit_budget_data_view_actual">
                             <i class="fas fa-chart-line mr-2"></i>Actual
                         </label>
-                        <input type="number" step="0.01" id="edit_budget_data_view_actual" class="form-input bg-gray-100" readonly>
+                        <input type="number" step="0.01" id="edit_budget_data_view_actual" name="actual" class="form-input">
                     </div>
                     <div class="mb-4">
-                        <label class="block text-gray-700 font-medium mb-2">
+                        <label class="block text-gray-700 font-medium mb-2" for="edit_budget_data_view_forecast">
                             <i class="fas fa-chart-line mr-2"></i>Forecast
                         </label>
-                        <input type="number" step="0.01" id="edit_budget_data_view_forecast" class="form-input bg-gray-100" readonly>
+                        <input type="number" step="0.01" id="edit_budget_data_view_forecast" name="forecast" class="form-input">
                     </div>
                     <div class="mb-4">
                         <label class="block text-gray-700 font-medium mb-2">
@@ -2293,7 +2309,7 @@ $total_budget_preview_pages = ceil($total_budget_preview_records / $records_per_
                         document.getElementById('edit_budget_data_view_certified').value = data.record.certified || 'uncertified';
                        
                         
-                        // Populate view-only fields
+                        // Populate computed fields
                         document.getElementById('edit_budget_data_view_actual').value = data.record.actual || 0;
                         document.getElementById('edit_budget_data_view_forecast').value = data.record.forecast || 0;
                         document.getElementById('edit_budget_data_view_actual_plus_forecast').value = data.record.actual_plus_forecast || 0;
@@ -2303,6 +2319,17 @@ $total_budget_preview_pages = ceil($total_budget_preview_records / $records_per_
                         // Show the edit modal
                         document.getElementById('editBudgetDataModal').style.display = 'flex';
                         console.log('Modal should now be visible');
+
+                        // Hook up live recalculation for computed fields
+                        const budgetInput = document.getElementById('edit_budget_data_budget');
+                        const actualInput = document.getElementById('edit_budget_data_view_actual');
+                        const forecastInput = document.getElementById('edit_budget_data_view_forecast');
+                        const recalc = () => recalcEditComputedFields();
+                        budgetInput.oninput = recalc;
+                        actualInput.oninput = recalc;
+                        forecastInput.oninput = recalc;
+                        // Initial calc
+                        recalcEditComputedFields();
                     } else {
                         console.error('Error fetching record:', data.message);
                         alert('Error fetching record: ' + data.message);
@@ -2312,6 +2339,20 @@ $total_budget_preview_pages = ceil($total_budget_preview_records / $records_per_
                     console.error('Error fetching record:', error);
                     alert('Error fetching record: ' + error);
                 });
+        }
+
+        // Compute Actual+Forecast and Variance% in Edit modal
+        function recalcEditComputedFields() {
+            const budget = parseFloat(document.getElementById('edit_budget_data_budget').value || '0');
+            const actual = parseFloat(document.getElementById('edit_budget_data_view_actual').value || '0');
+            const forecast = parseFloat(document.getElementById('edit_budget_data_view_forecast').value || '0');
+            const apf = (isNaN(actual) ? 0 : actual) + (isNaN(forecast) ? 0 : forecast);
+            document.getElementById('edit_budget_data_view_actual_plus_forecast').value = apf.toFixed(2);
+            let variance = -100.0;
+            if (!isNaN(budget) && budget > 0) {
+                variance = ((budget - apf) / budget) * 100.0;
+            }
+            document.getElementById('edit_budget_data_view_variance_percentage').value = variance.toFixed(2);
         }
         
         function closeEditBudgetDataModal() {

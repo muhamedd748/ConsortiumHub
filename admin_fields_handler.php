@@ -534,7 +534,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $year = $_POST['year'] ?? '';
                 $category_name = $_POST['category_name'] ?? '';
                 $period_name = $_POST['period_name'] ?? '';
-                $budget = $_POST['budget'] ?? null;
+            $budget = $_POST['budget'] ?? null;
+            // New: optional actual and forecast inputs from Add modal
+            $actual = $_POST['actual'] ?? 0;
+            $forecast = $_POST['forecast'] ?? 0;
                 $cluster = $_POST['cluster'] ?? '';
                 $quarter_number = $_POST['quarter_number'] ?? null;
                 $start_date = $_POST['start_date'] ?? null;
@@ -549,10 +552,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     exit();
                 }
                 
-                // Insert new budget data record
-                $insertQuery = "INSERT INTO budget_data (year, category_name, period_name, budget, cluster, quarter_number, start_date, end_date, year2, currency) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-                $stmt = $conn->prepare($insertQuery);
-                $stmt->bind_param("issssissss", $year, $category_name, $period_name, $budget, $cluster, $quarter_number, $start_date, $end_date, $year2, $currency);
+            // Normalize numeric values
+            $budgetVal = is_numeric($budget) ? (float)$budget : 0.0;
+            $actualVal = is_numeric($actual) ? (float)$actual : 0.0;
+            $forecastVal = is_numeric($forecast) ? (float)$forecast : 0.0;
+            // Auto-calculate computed fields
+            $actualPlusForecast = $actualVal + $forecastVal;
+            $variancePercentage = ($budgetVal > 0)
+                ? round((($budgetVal - $actualPlusForecast) / $budgetVal) * 100, 2)
+                : -100.00;
+
+            // Insert new budget data record including forecast and computed fields
+            $insertQuery = "INSERT INTO budget_data (year, category_name, period_name, budget, actual, forecast, actual_plus_forecast, variance_percentage, cluster, quarter_number, start_date, end_date, year2, currency) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            $stmt = $conn->prepare($insertQuery);
+            $stmt->bind_param(
+                "issdddddsissis",
+                $year,
+                $category_name,
+                $period_name,
+                $budgetVal,
+                $actualVal,
+                $forecastVal,
+                $actualPlusForecast,
+                $variancePercentage,
+                $cluster,
+                $quarter_number,
+                $start_date,
+                $end_date,
+                $year2,
+                $currency
+            );
                 
                 if ($stmt->execute()) {
                     $_SESSION['success_message'] = "Budget data record added successfully";
@@ -611,7 +640,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     // Log headers for debugging
                     error_log('Excel headers: ' . json_encode($headers));
                     
-                    // Required headers
+                    // Required headers (Forecast can be optional but supported)
                     $requiredHeaders = ['Year', 'Category Name', 'Period Name', 'Budget', 'Quarter', 'Start Date', 'End Date'];
                     foreach ($requiredHeaders as $requiredHeader) {
                         if (!in_array($requiredHeader, $headers)) {
@@ -647,6 +676,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $categoryNameCol = findColumnIndex($headers, 'Category Name');
                     $periodNameCol = findColumnIndex($headers, 'Period Name');
                     $budgetCol = findColumnIndex($headers, 'Budget');
+                    $forecastCol = findColumnIndex($headers, 'Forecast'); // optional
                     $quarterNumberCol = findColumnIndex($headers, 'Quarter');
                     $startDateCol = findColumnIndex($headers, 'Start Date');
                     $endDateCol = findColumnIndex($headers, 'End Date');
@@ -657,7 +687,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $currencyCol = findColumnIndex($headers, 'Currency');
                     
                     // Log column indices for debugging
-                    error_log("Year column: $yearCol, Category column: $categoryNameCol, Period column: $periodNameCol, Budget column: $budgetCol, Quarter column: $quarterNumberCol, StartDate column: $startDateCol, EndDate column: $endDateCol");
+                    error_log("Year column: $yearCol, Category column: $categoryNameCol, Period column: $periodNameCol, Budget column: $budgetCol, Forecast column: $forecastCol, Quarter column: $quarterNumberCol, StartDate column: $startDateCol, EndDate column: $endDateCol");
                     error_log("Cluster column: $clusterCol, Year2 column: $year2Col, Currency column: $currencyCol");
                     
                     // Validate that all required columns were found
@@ -679,8 +709,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         }
                     }
                     
-                    // Prepare insert statement
-                    $insertQuery = "INSERT INTO budget_data (year, category_name, period_name, budget, cluster, quarter_number, start_date, end_date, year2, currency) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    // Prepare insert statement (includes forecast and computed fields)
+                    $insertQuery = "INSERT INTO budget_data (year, category_name, period_name, budget, actual, forecast, actual_plus_forecast, variance_percentage, cluster, quarter_number, start_date, end_date, year2, currency) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                     $stmt = $conn->prepare($insertQuery);
                     
                     $importedCount = 0;
@@ -734,6 +764,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             $categoryName = $worksheet->getCell(\PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($categoryNameCol) . $row)->getValue();
                             $periodName = $worksheet->getCell(\PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($periodNameCol) . $row)->getValue();
                             $budget = $worksheet->getCell(\PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($budgetCol) . $row)->getValue();
+                            // Optional forecast
+                            $forecastValue = 0;
+                            if ($forecastCol !== false) {
+                                $forecastValue = $worksheet->getCell(\PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($forecastCol) . $row)->getValue();
+                            }
                             $quarterNumber = $worksheet->getCell(\PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($quarterNumberCol) . $row)->getValue();
                             $startDate = $worksheet->getCell(\PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($startDateCol) . $row)->getValue();
                             $endDate = $worksheet->getCell(\PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($endDateCol) . $row)->getValue();
@@ -815,11 +850,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 continue;
                             }
                             
+                            // Normalize numeric values and compute
+                            $budgetVal = is_numeric($budget) ? (float)$budget : 0.0;
+                            $actualVal = 0.0; // Excel import doesn't provide actual; default 0
+                            $forecastVal = is_numeric($forecastValue) ? (float)$forecastValue : 0.0;
+                            $actualPlusForecast = $actualVal + $forecastVal;
+                            $variancePercentage = ($budgetVal > 0)
+                                ? round((($budgetVal - $actualPlusForecast) / $budgetVal) * 100, 2)
+                                : -100.00;
+
                             // Log values for debugging
-                            error_log("Row $row: Inserting values - Year: $year, Category: $categoryName, Period: $periodName, Budget: $budget, Cluster: $clusterValue, Quarter: $quarterNumber, StartDate: $startDate, EndDate: $endDate, Year2: $year2Value, Currency: $currencyValue");
+                            error_log("Row $row: Inserting values - Year: $year, Category: $categoryName, Period: $periodName, Budget: $budgetVal, Forecast: $forecastVal, APF: $actualPlusForecast, Var%: $variancePercentage, Cluster: $clusterValue, Quarter: $quarterNumber, StartDate: $startDate, EndDate: $endDate, Year2: $year2Value, Currency: $currencyValue");
                             
                             // Bind parameters and execute
-                            $stmt->bind_param("issssissss", $year, $categoryName, $periodName, $budget, $clusterValue, $quarterNumber, $startDate, $endDate, $year2Value, $currencyValue);
+                            $stmt->bind_param(
+                                "issdddddsissis",
+                                $year,
+                                $categoryName,
+                                $periodName,
+                                $budgetVal,
+                                $actualVal,
+                                $forecastVal,
+                                $actualPlusForecast,
+                                $variancePercentage,
+                                $clusterValue,
+                                $quarterNumber,
+                                $startDate,
+                                $endDate,
+                                $year2Value,
+                                $currencyValue
+                            );
                             
                             if ($stmt->execute()) {
                                 $importedCount++;
@@ -1113,7 +1173,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $year = $_POST['year'] ?? '';
                 $category_name = $_POST['category_name'] ?? '';
                 $period_name = $_POST['period_name'] ?? '';
-                $budget = $_POST['budget'] ?? null;
+            $budget = $_POST['budget'] ?? null;
+            // New: editable Actual and Forecast in edit modal
+            $actual = $_POST['actual'] ?? 0;
+            $forecast = $_POST['forecast'] ?? 0;
                 $cluster = $_POST['cluster'] ?? '';
                 $quarter_number = $_POST['quarter_number'] ?? null;
                 $start_date = $_POST['start_date'] ?? null;
@@ -1128,10 +1191,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     exit();
                 }
                 
-                // Update budget data record
-                $updateQuery = "UPDATE budget_data SET year = ?, category_name = ?, period_name = ?, budget = ?, cluster = ?, quarter_number = ?, start_date = ?, end_date = ?, year2 = ?, currency = ? WHERE id = ?";
-                $stmt = $conn->prepare($updateQuery);
-                $stmt->bind_param("issssissssi", $year, $category_name, $period_name, $budget, $cluster, $quarter_number, $start_date, $end_date, $year2, $currency, $id);
+            // Normalize numeric values and compute
+            $budgetVal = is_numeric($budget) ? (float)$budget : 0.0;
+            $actualVal = is_numeric($actual) ? (float)$actual : 0.0;
+            $forecastVal = is_numeric($forecast) ? (float)$forecast : 0.0;
+            $actualPlusForecast = $actualVal + $forecastVal;
+            $variancePercentage = ($budgetVal > 0)
+                ? round((($budgetVal - $actualPlusForecast) / $budgetVal) * 100, 2)
+                : -100.00;
+
+            // Update budget data record including actual/forecast and computed fields
+            $updateQuery = "UPDATE budget_data SET year = ?, category_name = ?, period_name = ?, budget = ?, actual = ?, forecast = ?, actual_plus_forecast = ?, variance_percentage = ?, cluster = ?, quarter_number = ?, start_date = ?, end_date = ?, year2 = ?, currency = ? WHERE id = ?";
+            $stmt = $conn->prepare($updateQuery);
+            $stmt->bind_param(
+                "issdddddsissisi",
+                $year,
+                $category_name,
+                $period_name,
+                $budgetVal,
+                $actualVal,
+                $forecastVal,
+                $actualPlusForecast,
+                $variancePercentage,
+                $cluster,
+                $quarter_number,
+                $start_date,
+                $end_date,
+                $year2,
+                $currency,
+                $id
+            );
                 
                 if ($stmt->execute()) {
                     echo json_encode(['success' => true, 'message' => 'Budget data record updated successfully']);
