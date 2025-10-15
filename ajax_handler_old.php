@@ -129,14 +129,18 @@ try {
             $originalNamesStr = implode(',', $originalNames);
             
             // Get budget data before inserting transaction
-            $categoryMappings = [
-                'Administrative costs' => '1. Administrative costs',
-                'Operational support costs' => '2. Operational support costs',
-                'Consortium Activities' => '3. Consortium Activities',
-                'Targeting new CSOs' => '4. Targeting new CSOs',
-                'Contingency' => '5. Contingency'
-            ];
-            $mappedCategoryName = $categoryMappings[$budgetHeading] ?? $budgetHeading;
+            // Normalize category input to support both numbered and non-numbered forms, case-insensitive
+            // Based on user's database format, category names are stored WITHOUT prefixes
+            $normalizeCategory = function(string $cat): string {
+                $original = trim($cat);
+                // For user's database, we need to strip prefixes, not add them
+                $stripped = preg_replace('/^\s*\d+\s*\.\s*/', '', $original);
+                return $stripped;
+            };
+            $mappedCategoryName = $normalizeCategory($budgetHeading);
+            
+            // Debug logging
+            error_log("AJAX Handler - Budget heading: '$budgetHeading', Mapped category: '$mappedCategoryName'");
             
             // Determine quarter from entry date
             $entryDateTime = new DateTime($entryDate);
@@ -153,12 +157,21 @@ try {
             $currencyRates = [];
             if ($userCluster) {
                 $currencyRates = getCurrencyRatesByClusterNameMySQLi($conn, $userCluster);
-            } else {
-                // Default rates if no cluster is assigned
+            }
+            if (!$currencyRates) {
+                // Default rates if not found
                 $currencyRates = [
                     'USD_to_ETB' => 55.0000,
                     'EUR_to_ETB' => 60.0000
                 ];
+            }
+
+            // If cluster has custom currency rates enabled and custom rate provided, override USD/EUR -> ETB for this request
+            if (isClusterCustomCurrencyEnabled($conn, $userCluster) && isset($_POST['use_custom_rate']) && $_POST['use_custom_rate'] === '1') {
+                $customUsdToEtb = isset($_POST['usd_to_etb']) ? floatval($_POST['usd_to_etb']) : 0;
+                $customEurToEtb = isset($_POST['eur_to_etb']) ? floatval($_POST['eur_to_etb']) : 0;
+                if ($customUsdToEtb > 0) { $currencyRates['USD_to_ETB'] = $customUsdToEtb; }
+                if ($customEurToEtb > 0) { $currencyRates['EUR_to_ETB'] = $customEurToEtb; }
             }
             
             // Find the correct quarter and get budget data with cluster consideration
@@ -194,23 +207,52 @@ try {
             // Convert amount from ETB to target currency
             $amount = convertCurrency($amountETB, 'ETB', $targetCurrency, $currencyRates);
             
-            // Set budget tracking values for budget_preview table
+            // Set budget tracking values for budget_preview table (use values as-is from budget_data)
             $quarterPeriod = $quarterBudgetData['period_name'] ?? 'Unknown';
-            $originalBudget = $quarterBudgetData['budget'] ?? 0; // Original planned budget (unchanged)
-            $currentActual = $quarterBudgetData['actual'] ?? 0; // Current actual spending
-            $actualSpent = $currentActual + $amount; // What actual will be after this transaction
-            // Calculate forecast amount - this should be the remaining budget after actual spending
-            $forecastAmount = max($originalBudget - $actualSpent, 0); // Forecast = Budget - ActualSpent
-            // Remaining budget should be the same as forecast (what's left to spend)
-            $remainingBudget = $forecastAmount; // Remaining = Forecast (what's left to spend)
-            // Variance calculation: ((Budget - (Actual + Forecast)) / Budget) * 100
-            // Since Actual + Forecast = Budget, variance should be 0 for proper budget management
-            $variancePercentage = 0; // Variance is 0 when Actual + Forecast = Budget
+            $originalBudget = (float)($quarterBudgetData['budget'] ?? 0);
+            $currentActual = (float)($quarterBudgetData['actual'] ?? 0);
+            // For preview, take values directly from budget_data (will refresh after update below)
+            $actualSpent = $currentActual;
+            $forecastAmount = (float)($quarterBudgetData['forecast'] ?? 0);
+            $remainingBudget = $forecastAmount;
+            $variancePercentage = (float)($quarterBudgetData['variance_percentage'] ?? 0);
             
             // Prepare and execute statement
             error_log('AJAX Handler - Preparing database statement');
-            // Add cluster column to the INSERT statement and include currency
-            $stmt = $conn->prepare("INSERT INTO budget_preview (BudgetHeading, Outcome, Activity, BudgetLine, Description, Partner, EntryDate, Amount, PVNumber, DocumentPaths, DocumentTypes, OriginalNames, QuarterPeriod, CategoryName, OriginalBudget, RemainingBudget, ActualSpent, ForecastAmount, VariancePercentage, cluster, budget_id, currency, COMMENTS, ACCEPTANCE) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            // Capture custom rate usage for persistence
+            $useCustomRateFlag = 0;
+            $usdToEtbPersist = null;
+            $eurToEtbPersist = null;
+            $usdToEurPersist = null;
+            if (isClusterCustomCurrencyEnabled($conn, $userCluster) && isset($_POST['use_custom_rate']) && $_POST['use_custom_rate'] === '1') {
+                $useCustomRateFlag = 1;
+                $usdToEtbPersist = isset($_POST['usd_to_etb']) && floatval($_POST['usd_to_etb']) > 0 ? floatval($_POST['usd_to_etb']) : null;
+                $eurToEtbPersist = isset($_POST['eur_to_etb']) && floatval($_POST['eur_to_etb']) > 0 ? floatval($_POST['eur_to_etb']) : null;
+                // not always provided but keep slot available
+                $usdToEurPersist = isset($_POST['usd_to_eur']) && floatval($_POST['usd_to_eur']) > 0 ? floatval($_POST['usd_to_eur']) : null;
+            }
+
+            // Check if new rate columns exist; if not, fall back to legacy INSERT to avoid prepare errors
+            $hasRatesCols = false;
+            if ($resDb = $conn->query("SELECT DATABASE() as db")) {
+                $dbRowX = $resDb->fetch_assoc();
+                $dbNameX = $dbRowX['db'] ?? '';
+                if ($dbNameX) {
+                    $checkSql = "SELECT COUNT(*) as cnt FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = '" . $conn->real_escape_string($dbNameX) . "' AND TABLE_NAME = 'budget_preview' AND COLUMN_NAME = 'use_custom_rate'";
+                    if ($resCols = $conn->query($checkSql)) {
+                        $cntRow = $resCols->fetch_assoc();
+                        $hasRatesCols = intval($cntRow['cnt'] ?? 0) > 0;
+                    }
+                }
+            }
+
+            if ($hasRatesCols) {
+                // Insert including persisted custom rate columns
+                $stmt = $conn->prepare("INSERT INTO budget_preview (BudgetHeading, Outcome, Activity, BudgetLine, Description, Partner, EntryDate, Amount, PVNumber, DocumentPaths, DocumentTypes, OriginalNames, QuarterPeriod, CategoryName, OriginalBudget, RemainingBudget, ActualSpent, ForecastAmount, VariancePercentage, cluster, budget_id, currency, COMMENTS, ACCEPTANCE, use_custom_rate, usd_to_etb, eur_to_etb, usd_to_eur) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            } else {
+                // Legacy insert without custom rate columns
+                $stmt = $conn->prepare("INSERT INTO budget_preview (BudgetHeading, Outcome, Activity, BudgetLine, Description, Partner, EntryDate, Amount, PVNumber, DocumentPaths, DocumentTypes, OriginalNames, QuarterPeriod, CategoryName, OriginalBudget, RemainingBudget, ActualSpent, ForecastAmount, VariancePercentage, cluster, budget_id, currency, COMMENTS, ACCEPTANCE) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            }
             
             if (!$stmt) {
                 handleError('Database prepare error', $conn->error);
@@ -220,8 +262,67 @@ try {
             $emptyString = '';
             
             error_log('AJAX Handler - Binding parameters');
-            // Add cluster parameter, budget_id, and currency to the bind_param call
-            $stmt->bind_param("sssssssdssssssssddssisss", $budgetHeading, $outcome, $activity, $budgetLine, $description, $partner, $entryDate, $amount, $pvNumber, $documentPathsStr, $documentTypesStr, $originalNamesStr, $quarterPeriod, $mappedCategoryName, $originalBudget, $remainingBudget, $actualSpent, $forecastAmount, $variancePercentage, $userCluster, $budgetId, $targetCurrency, $emptyString, $emptyString);
+            
+            // DEBUG: Log all variables and their values
+            $debugVars = [
+                'budgetHeading' => $budgetHeading,
+                'outcome' => $outcome,
+                'activity' => $activity,
+                'budgetLine' => $budgetLine,
+                'description' => $description,
+                'partner' => $partner,
+                'entryDate' => $entryDate,
+                'amount' => $amount,
+                'pvNumber' => $pvNumber,
+                'documentPathsStr' => $documentPathsStr,
+                'documentTypesStr' => $documentTypesStr,
+                'originalNamesStr' => $originalNamesStr,
+                'quarterPeriod' => $quarterPeriod,
+                'mappedCategoryName' => $mappedCategoryName,
+                'originalBudget' => $originalBudget,
+                'remainingBudget' => $remainingBudget,
+                'actualSpent' => $actualSpent,
+                'forecastAmount' => $forecastAmount,
+                'variancePercentage' => $variancePercentage,
+                'userCluster' => $userCluster,
+                'budgetId' => $budgetId,
+                'targetCurrency' => $targetCurrency,
+                'emptyString' => $emptyString,
+                'hasRatesCols' => $hasRatesCols
+            ];
+            
+            if ($hasRatesCols) {
+                $debugVars['useCustomRateFlag'] = $useCustomRateFlag;
+                $debugVars['usdToEtbPersist'] = $usdToEtbPersist;
+                $debugVars['eurToEtbPersist'] = $eurToEtbPersist;
+                $debugVars['usdToEurPersist'] = $usdToEurPersist;
+                
+                error_log('DEBUG - hasRatesCols=true, variables: ' . json_encode($debugVars));
+                $typeString = "sssssssdssssssssddssisssiddd";
+                error_log('DEBUG - Type string: ' . $typeString . ' (length: ' . strlen($typeString) . ')');
+                error_log('DEBUG - Parameter count: 28');
+                
+                // With persisted custom rate fields
+                // Ensure all variables are defined
+                $useCustomRateFlag = $useCustomRateFlag ?? 0;
+                $usdToEtbPersist = $usdToEtbPersist ?? null;
+                $eurToEtbPersist = $eurToEtbPersist ?? null;
+                $usdToEurPersist = $usdToEurPersist ?? null;
+                
+                // Count actual parameters being passed
+                $params = [$budgetHeading, $outcome, $activity, $budgetLine, $description, $partner, $entryDate, $amount, $pvNumber, $documentPathsStr, $documentTypesStr, $originalNamesStr, $quarterPeriod, $mappedCategoryName, $originalBudget, $remainingBudget, $actualSpent, $forecastAmount, $variancePercentage, $userCluster, $budgetId, $targetCurrency, $emptyString, $emptyString, $useCustomRateFlag, $usdToEtbPersist, $eurToEtbPersist, $usdToEurPersist];
+                error_log('DEBUG - Actual parameter count: ' . count($params));
+                
+                $stmt->bind_param("sssssssdssssssssddssisssiddd", $budgetHeading, $outcome, $activity, $budgetLine, $description, $partner, $entryDate, $amount, $pvNumber, $documentPathsStr, $documentTypesStr, $originalNamesStr, $quarterPeriod, $mappedCategoryName, $originalBudget, $remainingBudget, $actualSpent, $forecastAmount, $variancePercentage, $userCluster, $budgetId, $targetCurrency, $emptyString, $emptyString, $useCustomRateFlag, $usdToEtbPersist, $eurToEtbPersist, $usdToEurPersist);
+            } else {
+                error_log('DEBUG - hasRatesCols=false, variables: ' . json_encode($debugVars));
+                $typeString = "sssssssdssssssssddssisss";
+                error_log('DEBUG - Type string: ' . $typeString . ' (length: ' . strlen($typeString) . ')');
+                error_log('DEBUG - Parameter count: 24');
+                
+                // Legacy binding without the extra columns - EXACT COPY of old working code
+                $stmt->bind_param("sssssssdssssssssddssisss", $budgetHeading, $outcome, $activity, $budgetLine, $description, $partner, $entryDate, $amount, $pvNumber, $documentPathsStr, $documentTypesStr, $originalNamesStr, $quarterPeriod, $mappedCategoryName, $originalBudget, $remainingBudget, $actualSpent, $forecastAmount, $variancePercentage, $userCluster, $budgetId, $targetCurrency, $emptyString, $emptyString);
+            }
             
             error_log('AJAX Handler - Executing statement');
             if ($stmt->execute()) {
@@ -237,6 +338,12 @@ try {
                 $transactionDate = $entryDateTime->format('Y-m-d');
                 
                 // Check if there's enough budget available for this transaction with proper filtering
+                // If quarter is 'Unknown', it means no budget period was found for the transaction date
+                if ($quarter === 'Unknown') {
+                    handleError('No budget period found for the transaction date', 
+                        "No budget period found for date $transactionDate, category $categoryName, year $year" . ($userCluster ? ", cluster $userCluster" : ""));
+                }
+                
                 $budgetCheckQuery = "SELECT budget, actual, forecast, id, currency FROM budget_data 
                                    WHERE year2 = ? AND category_name = ? 
                                    AND period_name = ?
@@ -266,16 +373,19 @@ try {
                 // Convert the entered amount to the same currency as the budget for comparison
                 $amountInBudgetCurrency = convertCurrency($amountETB, 'ETB', $budgetCurrency, $currencyRates);
                 
+                // Allow saving transactions even if budget is exceeded
+                // Comment out the budget validation check
+                /*
                 if ($amountInBudgetCurrency > $availableBudget) {
                     handleError('Insufficient budget available', 
                         "Transaction amount (" . number_format($amountInBudgetCurrency, 2) . " $budgetCurrency) exceeds available budget (" . number_format($availableBudget, 2) . " $budgetCurrency) for $categoryName in $quarter $year");
                 }
+                */
                 
-                // Update the quarter row: increase actual by amount, auto-adjust forecast to remaining budget, recompute actual_plus_forecast
+                // Update the quarter row: increase actual by amount, do NOT auto-update forecast, recompute actual_plus_forecast
                 // MySQL evaluates SET clauses left to right, so later expressions see updated column values
                 $updateBudgetQuery = "UPDATE budget_data SET 
                     actual = COALESCE(actual, 0) + ?,
-                    forecast = GREATEST(COALESCE(budget, 0) - COALESCE(actual, 0), 0),
                     actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
                     WHERE year2 = ? AND category_name = ? AND period_name = ?
                     AND ? BETWEEN start_date AND end_date";
@@ -345,30 +455,7 @@ try {
 
                     $actualStmt->execute();
                     
-                    // Update forecast for Annual Total with cluster consideration
-                    $updateForecastQuery = "UPDATE budget_data 
-                        SET forecast = (
-                            SELECT SUM(COALESCE(forecast, 0)) 
-                            FROM budget_data b4 
-                            WHERE b4.year2 = ? AND b4.category_name = ? AND b4.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
-
-                    if ($userCluster) {
-                        $updateForecastQuery .= " AND b4.cluster = ?";
-                    }
-
-                    $updateForecastQuery .= ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
-                    if ($userCluster) {
-                        $updateForecastQuery .= " AND cluster = ?";
-                        $forecastStmt = $conn->prepare($updateForecastQuery);
-                        $forecastStmt->bind_param("ississ", $year, $categoryName, $userCluster, $year, $categoryName, $userCluster);
-                    } else {
-                        $forecastStmt = $conn->prepare($updateForecastQuery);
-                        $forecastStmt->bind_param("isis", $year, $categoryName, $year, $categoryName);
-                    }
-
-                    $forecastStmt->execute();
-                    
-                    // Removed invalid standalone WHERE statement that caused SQL syntax error
+                    // Do not auto-update forecast for Annual Total; forecast remains manual
                     
                     // Update actual_plus_forecast for Annual Total with cluster consideration
                     $updateAnnualForecastQuery = "UPDATE budget_data 
@@ -432,29 +519,7 @@ try {
                     }
                     $totalActualStmt->execute();
                     
-                    // Update forecast for Total with cluster consideration
-                    $updateTotalForecastQuery = "UPDATE budget_data 
-                        SET forecast = (
-                            SELECT SUM(COALESCE(forecast, 0)) 
-                            FROM budget_data b4 
-                            WHERE b4.year2 = ? AND b4.period_name = 'Annual Total' AND b4.category_name != 'Total'";
-
-                    if ($userCluster) {
-                        $updateTotalForecastQuery .= " AND b4.cluster = ?";
-                    }
-
-                    $updateTotalForecastQuery .= ") WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'";
-                    if ($userCluster) {
-                        $updateTotalForecastQuery .= " AND cluster = ?";
-                        $totalForecastStmt = $conn->prepare($updateTotalForecastQuery);
-                        $totalForecastStmt->bind_param("isis", $year, $userCluster, $year, $userCluster);
-                    } else {
-                        $totalForecastStmt = $conn->prepare($updateTotalForecastQuery);
-                        $totalForecastStmt->bind_param("ii", $year, $year);
-                    }
-                    $totalForecastStmt->execute();
-                    
-                    // Removed invalid standalone WHERE statement for Total row
+                    // Do not auto-update forecast for Total; forecast remains manual
                     
                     // Update actual_plus_forecast for Total with cluster consideration
                     $updateTotalActualForecastQuery = "UPDATE budget_data 
@@ -533,15 +598,29 @@ try {
                     error_log('AJAX Handler - Failed to mark budget as uncertified: ' . $uncertifyStmt->error);
                 }
                 
-                // Update the budget_preview table with the budget_id for proper linking if not already set
+                // Update the budget_preview row with values read directly from budget_data (post-update), and set linkage
                 if ($budgetId && $insertId) {
-                    $updatePreviewQuery = "UPDATE budget_preview SET budget_id = ?, currency = ? WHERE PreviewID = ?";
-                    $updatePreviewStmt = $conn->prepare($updatePreviewQuery);
-                    $updatePreviewStmt->bind_param("isi", $budgetId, $targetCurrency, $insertId);
-                    if ($updatePreviewStmt->execute()) {
-                        error_log('AJAX Handler - Linked budget_preview record to budget_data record with ID: ' . $budgetId);
+                    // Read latest values from the corresponding budget_data row
+                    $bdStmt = $conn->prepare("SELECT budget, actual, forecast, variance_percentage FROM budget_data WHERE id = ?");
+                    $bdStmt->bind_param("i", $budgetId);
+                    if ($bdStmt->execute()) {
+                        $bdRes = $bdStmt->get_result();
+                        $bdRow = $bdRes->fetch_assoc();
+                        $bdBudget = (float)($bdRow['budget'] ?? 0);
+                        $bdActual = (float)($bdRow['actual'] ?? 0);
+                        $bdForecast = (float)($bdRow['forecast'] ?? 0);
+                        $bdVariance = (float)($bdRow['variance_percentage'] ?? 0);
+
+                        $updatePreviewQuery = "UPDATE budget_preview SET budget_id = ?, currency = ?, OriginalBudget = ?, RemainingBudget = ?, ActualSpent = ?, ForecastAmount = ?, VariancePercentage = ? WHERE PreviewID = ?";
+                        $updatePreviewStmt = $conn->prepare($updatePreviewQuery);
+                        $updatePreviewStmt->bind_param("isdddddi", $budgetId, $targetCurrency, $bdBudget, $bdForecast, $bdActual, $bdForecast, $bdVariance, $insertId);
+                        if ($updatePreviewStmt->execute()) {
+                            error_log('AJAX Handler - Linked and synced budget_preview with budget_data for ID: ' . $budgetId);
+                        } else {
+                            error_log('AJAX Handler - Failed to sync budget_preview from budget_data: ' . $updatePreviewStmt->error);
+                        }
                     } else {
-                        error_log('AJAX Handler - Failed to link budget_preview to budget_data: ' . $updatePreviewStmt->error);
+                        error_log('AJAX Handler - Failed to read budget_data for preview sync: ' . $bdStmt->error);
                     }
                 }
                 
@@ -578,8 +657,8 @@ try {
             $currencyRates = [];
             if ($userCluster) {
                 $currencyRates = getCurrencyRatesByClusterNameMySQLi($conn, $userCluster);
-            } else {
-                // Default rates if no cluster is assigned
+            }
+            if (!$currencyRates) {
                 $currencyRates = [
                     'USD_to_ETB' => 55.0000,
                     'EUR_to_ETB' => 60.0000
@@ -674,8 +753,8 @@ try {
             $currencyRates = [];
             if ($userCluster) {
                 $currencyRates = getCurrencyRatesByClusterNameMySQLi($conn, $userCluster);
-            } else {
-                // Default rates if no cluster is assigned
+            }
+            if (!$currencyRates) {
                 $currencyRates = [
                     'USD_to_ETB' => 55.0000,
                     'EUR_to_ETB' => 60.0000
@@ -741,12 +820,11 @@ try {
                 if ($budgetId) {
                     $updateBudgetQuery = "UPDATE budget_data SET 
                         actual = GREATEST(COALESCE(actual, 0) - ?, 0),
-                        forecast = COALESCE(budget, 0) - GREATEST(COALESCE(actual, 0) - ?, 0),
-                        actual_plus_forecast = GREATEST(COALESCE(actual, 0) - ?, 0) + COALESCE(forecast, 0)
+                        actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
                         WHERE id = ?";
                     
                     $updateStmt = $conn->prepare($updateBudgetQuery);
-                    $updateStmt->bind_param("dddi", $amount, $amount, $amount, $budgetId);
+                    $updateStmt->bind_param("di", $amount, $budgetId);
                     
                     if (!$updateStmt->execute()) {
                         throw new Exception("Failed to update budget data: " . $updateStmt->error);
@@ -765,35 +843,19 @@ try {
                             FROM budget_data b3 
                             WHERE b3.year2 = ? AND b3.category_name = ? AND b3.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')" . 
                             ($userCluster ? " AND b3.cluster = ?" : "") . "
-                        ),
-                        forecast = (
-                            SELECT SUM(COALESCE(forecast, 0)) 
-                            FROM budget_data b4 
-                            WHERE b4.year2 = ? AND b4.category_name = ? AND b4.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')" . 
-                            ($userCluster ? " AND b4.cluster = ?" : "") . "
-                        ),
-                        actual_plus_forecast = (
-                            SELECT SUM(COALESCE(actual_plus_forecast, 0)) 
-                            FROM budget_data b5 
-                            WHERE b5.year2 = ? AND b5.category_name = ? AND b5.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')" . 
-                            ($userCluster ? " AND b5.cluster = ?" : "") . "
                         )
                         WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'" . 
                         ($userCluster ? " AND cluster = ?" : "");
                     
                     if ($userCluster) {
                         $annualStmt = $conn->prepare($updateAnnualQuery);
-                        $annualStmt->bind_param("issississississis", 
-                            $year, $categoryName, $userCluster,
-                            $year, $categoryName, $userCluster,
+                        $annualStmt->bind_param("ississis", 
                             $year, $categoryName, $userCluster,
                             $year, $categoryName, $userCluster,
                             $year, $categoryName, $userCluster);
                     } else {
                         $annualStmt = $conn->prepare($updateAnnualQuery);
-                        $annualStmt->bind_param("isisisisisisi", 
-                            $year, $categoryName,
-                            $year, $categoryName,
+                        $annualStmt->bind_param("isisis", 
                             $year, $categoryName,
                             $year, $categoryName,
                             $year, $categoryName);
@@ -803,7 +865,7 @@ try {
                         throw new Exception("Failed to update annual budget data: " . $annualStmt->error);
                     }
                     
-                    // Update the Total row across all categories
+                    // Update the Total row across all categories (do not auto-update forecast)
                     $updateTotalQuery = "UPDATE budget_data 
                         SET budget = (
                             SELECT SUM(COALESCE(budget, 0)) 
@@ -816,40 +878,49 @@ try {
                             FROM budget_data b3 
                             WHERE b3.year2 = ? AND b3.period_name = 'Annual Total' AND b3.category_name != 'Total'" . 
                             ($userCluster ? " AND b3.cluster = ?" : "") . "
-                        ),
-                        forecast = (
-                            SELECT SUM(COALESCE(forecast, 0)) 
-                            FROM budget_data b4 
-                            WHERE b4.year2 = ? AND b4.period_name = 'Annual Total' AND b4.category_name != 'Total'" . 
-                            ($userCluster ? " AND b4.cluster = ?" : "") . "
-                        ),
-                        actual_plus_forecast = (
-                            SELECT SUM(COALESCE(actual_plus_forecast, 0)) 
-                            FROM budget_data b5 
-                            WHERE b5.year2 = ? AND b5.period_name = 'Annual Total' AND b5.category_name != 'Total'" . 
-                            ($userCluster ? " AND b5.cluster = ?" : "") . "
                         )
                         WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'" . 
                         ($userCluster ? " AND cluster = ?" : "");
                     
                     if ($userCluster) {
                         $totalStmt = $conn->prepare($updateTotalQuery);
-                        $totalStmt->bind_param("isisisisisisis", 
-                            $year, $userCluster,
-                            $year, $userCluster,
+                        $totalStmt->bind_param("isisis", 
                             $year, $userCluster,
                             $year, $userCluster,
                             $year, $userCluster);
                     } else {
                         $totalStmt = $conn->prepare($updateTotalQuery);
-                        $totalStmt->bind_param("iiiiii", 
-                            $year, $year, $year, $year, $year);
+                        $totalStmt->bind_param("iii", 
+                            $year, $year, $year);
                     }
                     
                     if (!$totalStmt->execute()) {
                         throw new Exception("Failed to update total budget data: " . $totalStmt->error);
                     }
                     
+                    // Update actual_plus_forecast for Annual Total and Total without altering forecast
+                    $updateAnnualAPF = "UPDATE budget_data SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0) WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'" . ($userCluster ? " AND cluster = ?" : "");
+                    $annualApfStmt = $conn->prepare($updateAnnualAPF);
+                    if ($userCluster) {
+                        $annualApfStmt->bind_param("iss", $year, $categoryName, $userCluster);
+                    } else {
+                        $annualApfStmt->bind_param("is", $year, $categoryName);
+                    }
+                    if (!$annualApfStmt->execute()) {
+                        throw new Exception("Failed to update Annual Total actual_plus_forecast: " . $annualApfStmt->error);
+                    }
+
+                    $updateTotalAPF = "UPDATE budget_data SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0) WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'" . ($userCluster ? " AND cluster = ?" : "");
+                    $totalApfStmt = $conn->prepare($updateTotalAPF);
+                    if ($userCluster) {
+                        $totalApfStmt->bind_param("is", $year, $userCluster);
+                    } else {
+                        $totalApfStmt->bind_param("i", $year);
+                    }
+                    if (!$totalApfStmt->execute()) {
+                        throw new Exception("Failed to update Total actual_plus_forecast: " . $totalApfStmt->error);
+                    }
+
                     // Update actual_plus_forecast for all quarter rows
                     $updateQuarterForecastQuery = "UPDATE budget_data 
                         SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
@@ -927,12 +998,20 @@ try {
             $currencyRates = [];
             if ($userCluster) {
                 $currencyRates = getCurrencyRatesByClusterNameMySQLi($conn, $userCluster);
-            } else {
-                // Default rates if no cluster is assigned
+            }
+            if (!$currencyRates) {
                 $currencyRates = [
                     'USD_to_ETB' => 55.0000,
                     'EUR_to_ETB' => 60.0000
                 ];
+            }
+
+            // If cluster has custom currency rates enabled and custom rate provided, override USD/EUR -> ETB for this request
+            if (isClusterCustomCurrencyEnabled($conn, $userCluster) && isset($_POST['use_custom_rate']) && $_POST['use_custom_rate'] === '1') {
+                $customUsdToEtb = isset($_POST['usd_to_etb']) ? floatval($_POST['usd_to_etb']) : 0;
+                $customEurToEtb = isset($_POST['eur_to_etb']) ? floatval($_POST['eur_to_etb']) : 0;
+                if ($customUsdToEtb > 0) { $currencyRates['USD_to_ETB'] = $customUsdToEtb; }
+                if ($customEurToEtb > 0) { $currencyRates['EUR_to_ETB'] = $customEurToEtb; }
             }
             
             if ($userCluster) {
@@ -1000,18 +1079,22 @@ try {
                 exit;
             }
             
-            // Map budget heading to category name
-            $categoryMappings = [
-                'Administrative costs' => '1. Administrative costs',
-                'Operational support costs' => '2. Operational support costs',
-                'Consortium Activities' => '3. Consortium Activities',
-                'Targeting new CSOs' => '4. Targeting new CSOs',
-                'Contingency' => '5. Contingency'
-            ];
-            $categoryName = $categoryMappings[$budgetHeading] ?? $budgetHeading;
+            // Map budget heading to category name (using the same logic as save_transaction)
+            // Based on user's database format, category names are stored WITHOUT prefixes
+            $normalizeCategory = function(string $cat): string {
+                $original = trim($cat);
+                // For user's database, we need to strip prefixes, not add them
+                $stripped = preg_replace('/^\s*\d+\s*\.\s*/', '', $original);
+                return $stripped;
+            };
+            $categoryName = $normalizeCategory($budgetHeading);
+            
+            // Debug logging
+            error_log("AJAX Handler - Check budget - Budget heading: '$budgetHeading', Normalized category: '$categoryName'");
             
             // Find the correct quarter based on date ranges in database with cluster consideration
-            $quarterQuery = "SELECT period_name, budget, actual, forecast, start_date, end_date 
+            // Use the same approach as save_transaction
+            $quarterQuery = "SELECT period_name, budget, actual, forecast, start_date, end_date, currency
                            FROM budget_data 
                            WHERE year2 = ? AND category_name = ? 
                            AND period_name IN ('Q1', 'Q2', 'Q3', 'Q4')
@@ -1049,8 +1132,11 @@ try {
             // Remaining available = budget - actual (handle NULLs) - forecast is future expectation, not committed spending
             $availableBudget = max((float)($quarterData['budget'] ?? 0) - (float)($quarterData['actual'] ?? 0), 0);
             
+            // Get the currency of the budget record
+            $budgetCurrency = $quarterData['currency'] ?? 'ETB';
+            
             // Convert available budget to ETB
-            $availableBudgetETB = convertCurrency($availableBudget, 'USD', 'ETB', $currencyRates);
+            $availableBudgetETB = convertCurrency($availableBudget, $budgetCurrency, 'ETB', $currencyRates);
             
             $quarter = $quarterData['period_name'];
             $startDate = $quarterData['start_date'];
@@ -1067,7 +1153,8 @@ try {
                 'year' => $year,
                 'date_range' => $dateRange,
                 'selected_date' => $date,
-                'cluster' => $userCluster
+                'cluster' => $userCluster,
+                'currency' => $budgetCurrency
             ]);
             exit;
             
@@ -1282,15 +1369,30 @@ try {
 
             error_log("Export CSV - Selected Cluster: " . ($selectedCluster ?? 'null'));
 
+            // Handle custom currency rates for admins
+            $customCurrencyRates = null;
+            if ($userRole === 'admin' && isset($_GET['use_custom_rates']) && $_GET['use_custom_rates'] == '1') {
+                $customCurrencyRates = [
+                    'USD_to_ETB' => isset($_GET['usd_to_etb']) ? floatval($_GET['usd_to_etb']) : 300.0000,
+                    'EUR_to_ETB' => isset($_GET['eur_to_etb']) ? floatval($_GET['eur_to_etb']) : 320.0000,
+                    'USD_to_EUR' => isset($_GET['usd_to_eur']) ? floatval($_GET['usd_to_eur']) : 0.9375
+                ];
+            }
+
             // Include currency functions and rates for conversion
             include_once 'currency_functions.php';
 
             // Determine cluster for rate lookup
             $ratesCluster = $selectedCluster ?? $userCluster ?? null;
             $currencyRates = [];
-            if ($ratesCluster) {
+            
+            if ($customCurrencyRates) {
+                // Use custom currency rates
+                $currencyRates = $customCurrencyRates;
+            } else if ($ratesCluster) {
                 $currencyRates = getCurrencyRatesByClusterNameMySQLi($conn, $ratesCluster) ?: [];
             }
+            
             if (!$currencyRates) {
                 // Fallback defaults
                 $currencyRates = [
@@ -1301,6 +1403,7 @@ try {
 
             // Use year2 column for proper year filtering (contains actual years like 2025)
             $sql = "SELECT 
+                PVNumber,
                 BudgetHeading,
                 Outcome,
                 Activity,
@@ -1309,7 +1412,11 @@ try {
                 Partner,
                 EntryDate,
                 Amount,
-                currency
+                currency,
+                use_custom_rate,
+                usd_to_etb,
+                eur_to_etb,
+                usd_to_eur
             FROM budget_preview
             WHERE YEAR(EntryDate) = ? ";
 
@@ -1343,7 +1450,7 @@ try {
             $fp = fopen('php://temp', 'w+');
             // UTF-8 BOM so Excel opens it correctly
             fwrite($fp, "\xEF\xBB\xBF");
-            fputcsv($fp, ['Budget Heading', 'Outcome', 'Activity', 'Budget Line', 'Transaction Description', 'Partner', 'Payment Date (dd/mm/yyyy)', 'Amount']);
+            fputcsv($fp, ['Ref No', 'Budget Heading', 'Outcome', 'Activity', 'Budget Line', 'Transaction Description', 'Partner', 'Payment Date (dd/mm/yyyy)', 'Amount']);
 
             // Check if we have data
             $rowCount = 0;
@@ -1351,12 +1458,29 @@ try {
                 while ($row = $result->fetch_assoc()) {
                     $rowCount++;
                     error_log("Export CSV - Processing row $rowCount: " . json_encode($row));
-                    // Convert amount to requested currency using cluster-specific rates
+                    
+                    // Use transaction's stored custom rates if available, otherwise use current rates
+                    $effectiveRates = $currencyRates;
+                    if (!empty($row['use_custom_rate']) && intval($row['use_custom_rate']) === 1) {
+                        // This transaction was created with custom rates, use those stored rates
+                        if (!empty($row['usd_to_etb'])) {
+                            $effectiveRates['USD_to_ETB'] = (float)$row['usd_to_etb'];
+                        }
+                        if (!empty($row['eur_to_etb'])) {
+                            $effectiveRates['EUR_to_ETB'] = (float)$row['eur_to_etb'];
+                        }
+                        if (!empty($row['usd_to_eur'])) {
+                            $effectiveRates['USD_to_EUR'] = (float)$row['usd_to_eur'];
+                        }
+                    }
+                    
+                    // Convert amount to requested currency using effective rates
                     $rowCurrency = $row['currency'] ?? 'ETB';
                     $amountOriginal = $row['Amount'] ? floatval($row['Amount']) : 0.0;
-                    $amountConverted = convertCurrency($amountOriginal, $rowCurrency, $targetCurrency, $currencyRates);
+                    $amountConverted = convertCurrency($amountOriginal, $rowCurrency, $targetCurrency, $effectiveRates);
 
                     $csvRow = [
+                        $row['PVNumber'] ?? '',
                         $row['BudgetHeading'] ?? '',
                         $row['Outcome'] ?? '',
                         $row['Activity'] ?? '',
@@ -1406,12 +1530,27 @@ try {
                 $selectedCluster = $userCluster;
             }
 
+            // Handle custom currency rates for admins
+            $customCurrencyRates = null;
+            if ($userRole === 'admin' && isset($_GET['use_custom_rates']) && $_GET['use_custom_rates'] == '1') {
+                $customCurrencyRates = [
+                    'USD_to_ETB' => isset($_GET['usd_to_etb']) ? floatval($_GET['usd_to_etb']) : 300.0000,
+                    'EUR_to_ETB' => isset($_GET['eur_to_etb']) ? floatval($_GET['eur_to_etb']) : 320.0000,
+                    'USD_to_EUR' => isset($_GET['usd_to_eur']) ? floatval($_GET['usd_to_eur']) : 0.9375
+                ];
+            }
+
             include_once 'currency_functions.php';
             $ratesCluster = $selectedCluster ?? $userCluster ?? null;
             $currencyRates = [];
-            if ($ratesCluster) {
+            
+            if ($customCurrencyRates) {
+                // Use custom currency rates
+                $currencyRates = $customCurrencyRates;
+            } else if ($ratesCluster) {
                 $currencyRates = getCurrencyRatesByClusterNameMySQLi($conn, $ratesCluster) ?: [];
             }
+            
             if (!$currencyRates) {
                 $currencyRates = [
                     'USD_to_ETB' => 300.0000,
@@ -1420,6 +1559,7 @@ try {
             }
 
             $sql = "SELECT 
+                PVNumber,
                 BudgetHeading,
                 Outcome,
                 Activity,
@@ -1428,7 +1568,11 @@ try {
                 Partner,
                 EntryDate,
                 Amount,
-                currency
+                currency,
+                use_custom_rate,
+                usd_to_etb,
+                eur_to_etb,
+                usd_to_eur
             FROM budget_preview
             WHERE YEAR(EntryDate) = ? ";
 
@@ -1451,17 +1595,34 @@ try {
 
             $fp = fopen('php://temp', 'w+');
             fwrite($fp, "\xEF\xBB\xBF");
-            fputcsv($fp, ['Budget Heading', 'Outcome', 'Activity', 'Budget Line', 'Transaction Description', 'Partner', 'Payment Date (dd/mm/yyyy)', 'Amount (ETB)', 'Amount (USD)', 'Amount (EUR)']);
+            fputcsv($fp, ['Ref No', 'Budget Heading', 'Outcome', 'Activity', 'Budget Line', 'Transaction Description', 'Partner', 'Payment Date (dd/mm/yyyy)', 'Amount (ETB)', 'Amount (USD)', 'Amount (EUR)']);
 
             if ($result->num_rows > 0) {
                 while ($row = $result->fetch_assoc()) {
                     $rowCurrency = $row['currency'] ?? 'ETB';
                     $amountOriginal = $row['Amount'] ? floatval($row['Amount']) : 0.0;
-                    $amtETB = convertCurrency($amountOriginal, $rowCurrency, 'ETB', $currencyRates);
-                    $amtUSD = convertCurrency($amountOriginal, $rowCurrency, 'USD', $currencyRates);
-                    $amtEUR = convertCurrency($amountOriginal, $rowCurrency, 'EUR', $currencyRates);
+                    
+                    // Use transaction's stored custom rates if available, otherwise use current rates
+                    $effectiveRates = $currencyRates;
+                    if (!empty($row['use_custom_rate']) && intval($row['use_custom_rate']) === 1) {
+                        // This transaction was created with custom rates, use those stored rates
+                        if (!empty($row['usd_to_etb'])) {
+                            $effectiveRates['USD_to_ETB'] = (float)$row['usd_to_etb'];
+                        }
+                        if (!empty($row['eur_to_etb'])) {
+                            $effectiveRates['EUR_to_ETB'] = (float)$row['eur_to_etb'];
+                        }
+                        if (!empty($row['usd_to_eur'])) {
+                            $effectiveRates['USD_to_EUR'] = (float)$row['usd_to_eur'];
+                        }
+                    }
+                    
+                    $amtETB = convertCurrency($amountOriginal, $rowCurrency, 'ETB', $effectiveRates);
+                    $amtUSD = convertCurrency($amountOriginal, $rowCurrency, 'USD', $effectiveRates);
+                    $amtEUR = convertCurrency($amountOriginal, $rowCurrency, 'EUR', $effectiveRates);
 
                     fputcsv($fp, [
+                        $row['PVNumber'] ?? '',
                         $row['BudgetHeading'] ?? '',
                         $row['Outcome'] ?? '',
                         $row['Activity'] ?? '',
