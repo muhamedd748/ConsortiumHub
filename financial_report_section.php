@@ -494,11 +494,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                             }
                             */
                             
-                            // Update the quarter row: increase actual by amount, auto-adjust forecast to remaining budget, recompute actual_plus_forecast
-                            // MySQL evaluates SET clauses left to right, so later expressions see updated column values
-                            // We need to calculate forecast based on original actual value to avoid compounding errors
+                            // Update the quarter row: increase actual by amount, recalc forecast to keep Budget = Actual + Forecast, recompute actual_plus_forecast
+                            // MySQL evaluates SET clauses left to right; forecast uses the updated actual value
                             $updateBudgetQuery = "UPDATE budget_data SET 
                                 actual = COALESCE(actual, 0) + ?,
+                                forecast = GREATEST(COALESCE(budget, 0) - COALESCE(actual, 0), 0),
                                 actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
                                 WHERE year2 = ? AND category_name = ? AND period_name = ?
                                 AND ? BETWEEN start_date AND end_date";
@@ -568,10 +568,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 
                                 $actualStmt->execute();
                                 
-                                // Do not auto-update forecast for Annual Total; forecast remains manual
-                                
-                                // Removed invalid standalone WHERE statement that caused SQL syntax error
-                                
+                                // Sync Annual Total forecast as sum of quarterly forecasts
+                                $updateAnnualForecastSumQuery = "UPDATE budget_data 
+                                    SET forecast = (
+                                        SELECT COALESCE(SUM(forecast), 0) 
+                                        FROM budget_data b 
+                                        WHERE b.year2 = ? AND b.category_name = ? AND b.period_name IN ('Q1','Q2','Q3','Q4')";
+                                if ($userCluster) {
+                                    $updateAnnualForecastSumQuery .= " AND b.cluster = ?";
+                                }
+                                $updateAnnualForecastSumQuery .= ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
+                                if ($userCluster) {
+                                    $updateAnnualForecastSumQuery .= " AND cluster = ?";
+                                    $annualForecastSumStmt = $conn->prepare($updateAnnualForecastSumQuery);
+                                    $annualForecastSumStmt->bind_param("ississ", $year, $categoryName, $userCluster, $year, $categoryName, $userCluster);
+                                } else {
+                                    $annualForecastSumStmt = $conn->prepare($updateAnnualForecastSumQuery);
+                                    $annualForecastSumStmt->bind_param("isis", $year, $categoryName, $year, $categoryName);
+                                }
+                                $annualForecastSumStmt->execute();
+
                                 // Update actual_plus_forecast for Annual Total with cluster consideration
                                 $updateAnnualForecastQuery = "UPDATE budget_data 
                                     SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
@@ -634,10 +650,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                                 }
                                 $totalActualStmt->execute();
                                 
-                                // Do not auto-update forecast for Total; forecast remains manual
-                                
-                                // Removed invalid standalone WHERE statement for Total row
-                                
+                                // Sync Total forecast as sum of Annual Total forecasts across categories
+                                $updateTotalForecastSumQuery = "UPDATE budget_data 
+                                    SET forecast = (
+                                        SELECT COALESCE(SUM(forecast), 0)
+                                        FROM budget_data b2 
+                                        WHERE b2.year2 = ? AND b2.period_name = 'Annual Total' AND b2.category_name != 'Total'";
+                                if ($userCluster) {
+                                    $updateTotalForecastSumQuery .= " AND b2.cluster = ?";
+                                }
+                                $updateTotalForecastSumQuery .= ") WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'";
+                                if ($userCluster) {
+                                    $totalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
+                                    $totalForecastSumStmt->bind_param("isis", $year, $userCluster, $year, $userCluster);
+                                } else {
+                                    $totalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
+                                    $totalForecastSumStmt->bind_param("ii", $year, $year);
+                                }
+                                $totalForecastSumStmt->execute();
+
                                 // Update actual_plus_forecast for Total with cluster consideration
                                 $updateTotalActualForecastQuery = "UPDATE budget_data 
                                     SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
@@ -724,6 +755,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                                     error_log('AJAX Handler - Linked budget_preview record to budget_data record with ID: ' . $budgetId);
                                 } else {
                                     error_log('AJAX Handler - Failed to link budget_preview to budget_data: ' . $updatePreviewStmt->error);
+                                }
+
+                                // Also sync preview financial fields from budget_data
+                                $bdStmt = $conn->prepare("SELECT budget, actual, forecast, variance_percentage FROM budget_data WHERE id = ?");
+                                $bdStmt->bind_param("i", $budgetId);
+                                if ($bdStmt->execute()) {
+                                    $bdRes = $bdStmt->get_result();
+                                    if ($bdRow = $bdRes->fetch_assoc()) {
+                                        $bdBudget = (float)($bdRow['budget'] ?? 0);
+                                        $bdActual = (float)($bdRow['actual'] ?? 0);
+                                        $bdForecast = (float)($bdRow['forecast'] ?? 0);
+                                        $bdVariance = (float)($bdRow['variance_percentage'] ?? 0);
+
+                                        $syncPreviewQuery = "UPDATE budget_preview SET OriginalBudget = ?, RemainingBudget = ?, ActualSpent = ?, ForecastAmount = ?, VariancePercentage = ? WHERE PreviewID = ?";
+                                        $syncPreviewStmt = $conn->prepare($syncPreviewQuery);
+                                        $syncPreviewStmt->bind_param("dddddi", $bdBudget, $bdForecast, $bdActual, $bdForecast, $bdVariance, $insertId);
+                                        if ($syncPreviewStmt->execute()) {
+                                            error_log('AJAX Handler - Synced preview financial fields for preview ID: ' . $insertId);
+                                        } else {
+                                            error_log('AJAX Handler - Failed syncing preview fields: ' . $syncPreviewStmt->error);
+                                        }
+                                    }
+                                } else {
+                                    error_log('AJAX Handler - Failed to read budget_data for preview sync: ' . $bdStmt->error);
                                 }
                             }
                             

@@ -220,9 +220,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             
             // Calculate new actual value (subtract the original amount)
             $newActual = max(0, $currentActual - $originalAmount);
-            
-            // Calculate new actual_plus_forecast using existing manual forecast
-            $newActualPlusForecast = $newActual + ($currentForecast ?? 0);
+            // Recalculate forecast to keep Budget = Actual + Forecast
+            $newForecast = max(0, ($currentBudget ?? 0) - $newActual);
+            // Calculate new actual_plus_forecast using the recalculated forecast
+            $newActualPlusForecast = $newActual + $newForecast;
             
             // Calculate new variance percentage using the correct formula
             // Variance = ((Budget - (Actual + Forecast)) / Budget) * 100
@@ -233,15 +234,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $newVariancePercentage = -100.00;
             }
             
-            // Update the specific quarter row in budget_data (keep forecast manual)
+            // Update the specific quarter row in budget_data including recalculated forecast
             $updateBudgetQuery = "UPDATE budget_data SET 
                 actual = :actual,
+                forecast = :forecast,
                 actual_plus_forecast = :actualPlusForecast,
                 variance_percentage = :variancePercentage
                 WHERE id = :budgetId";
             $updateStmt = $conn->prepare($updateBudgetQuery);
             $updateStmt->execute([
                 ':actual' => $newActual,
+                ':forecast' => $newForecast,
                 ':actualPlusForecast' => $newActualPlusForecast,
                 ':variancePercentage' => $newVariancePercentage,
                 ':budgetId' => $budgetId
@@ -284,8 +287,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $updateAnnualStmt = $conn->prepare($updateAnnualQuery);
                 $updateAnnualStmt->execute($annualParams);
                 
-                // Do not auto-update forecast for Annual Total; keep it manual
-                
+                // Sync Annual Total forecast as the sum of quarterly forecasts
+                $updateAnnualForecastSumQuery = "UPDATE budget_data 
+                    SET forecast = (
+                        SELECT SUM(COALESCE(forecast, 0)) FROM budget_data b 
+                        WHERE b.year2 = :year AND b.category_name = :categoryName 
+                        AND b.period_name IN ('Q1','Q2','Q3','Q4')";
+                $annualForecastParams = [
+                    ':year' => $year,
+                    ':categoryName' => $originalCategoryName
+                ];
+                if ($cluster) {
+                    $updateAnnualForecastSumQuery .= " AND b.cluster = :cluster";
+                    $annualForecastParams[':cluster'] = $cluster;
+                }
+                $updateAnnualForecastSumQuery .= ") WHERE year2 = :year2 AND category_name = :categoryName2 AND period_name = 'Annual Total'";
+                $annualForecastParams[':year2'] = $year;
+                $annualForecastParams[':categoryName2'] = $originalCategoryName;
+                if ($cluster) {
+                    $updateAnnualForecastSumQuery .= " AND cluster = :cluster2";
+                    $annualForecastParams[':cluster2'] = $cluster;
+                }
+                $updateAnnualForecastSumStmt = $conn->prepare($updateAnnualForecastSumQuery);
+                $updateAnnualForecastSumStmt->execute($annualForecastParams);
+
                 // Update actual_plus_forecast for Annual Total
                 $updateAnnualActualForecastQuery = "UPDATE budget_data 
                     SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
@@ -352,8 +377,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $updateTotalStmt = $conn->prepare($updateTotalQuery);
                 $updateTotalStmt->execute($totalParams);
                 
-                // Do not auto-update forecast for Total row; keep it manual
-                
+                // Sync Total forecast as sum of Annual Total forecasts across categories
+                $updateTotalForecastSumQuery = "UPDATE budget_data 
+                    SET forecast = (
+                        SELECT SUM(COALESCE(forecast, 0)) FROM budget_data b 
+                        WHERE b.year2 = :year AND b.period_name = 'Annual Total' AND b.category_name != 'Total'";
+                $totalForecastParams = [
+                    ':year' => $year
+                ];
+                if ($cluster) {
+                    $updateTotalForecastSumQuery .= " AND b.cluster = :cluster";
+                    $totalForecastParams[':cluster'] = $cluster;
+                }
+                $updateTotalForecastSumQuery .= ") WHERE year2 = :year2 AND category_name = 'Total' AND period_name = 'Total'";
+                $totalForecastParams[':year2'] = $year;
+                if ($cluster) {
+                    $updateTotalForecastSumQuery .= " AND cluster = :cluster2";
+                    $totalForecastParams[':cluster2'] = $cluster;
+                }
+                $updateTotalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
+                $updateTotalForecastSumStmt->execute($totalForecastParams);
+
                 // Update actual_plus_forecast for Total row
                 $updateTotalActualForecastQuery = "UPDATE budget_data 
                     SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
@@ -486,9 +530,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 
                 // Calculate new actual value (add the new amount)
                 $newActual = max(0, $currentActual + $amount);
+                // Recalculate forecast to keep Budget = Actual + Forecast
+                $newForecast = max(0, ($currentBudget ?? 0) - $newActual);
                 
-                // Calculate new actual_plus_forecast using existing manual forecast
-                $newActualPlusForecast = $newActual + ($currentForecast ?? 0);
+                // Calculate new actual_plus_forecast using recalculated forecast
+                $newActualPlusForecast = $newActual + $newForecast;
                 
                 // Calculate new variance percentage using the correct formula
                 // Variance = ((Budget - (Actual + Forecast)) / Budget) * 100
@@ -499,15 +545,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $newVariancePercentage = -100.00;
                 }
                 
-                // Update the specific quarter row in budget_data (keep forecast manual)
+                // Update the specific quarter row in budget_data including recalculated forecast
                 $updateBudgetQuery = "UPDATE budget_data SET 
                     actual = :actual,
+                    forecast = :forecast,
                     actual_plus_forecast = :actualPlusForecast,
                     variance_percentage = :variancePercentage
                     WHERE id = :budgetId";
                 $updateStmt = $conn->prepare($updateBudgetQuery);
                 $updateStmt->execute([
                     ':actual' => $newActual,
+                    ':forecast' => $newForecast,
                     ':actualPlusForecast' => $newActualPlusForecast,
                     ':variancePercentage' => $newVariancePercentage,
                     ':budgetId' => $budgetId
@@ -550,8 +598,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $updateAnnualStmt = $conn->prepare($updateAnnualQuery);
                     $updateAnnualStmt->execute($annualParams);
                     
-                    // Do not auto-update forecast for Annual Total; keep it manual
-                    
+                    // Sync Annual Total forecast as the sum of quarterly forecasts
+                    $updateAnnualForecastSumQuery = "UPDATE budget_data 
+                        SET forecast = (
+                            SELECT SUM(COALESCE(forecast, 0)) 
+                            FROM budget_data b 
+                            WHERE b.year2 = :year AND b.category_name = :categoryName 
+                            AND b.period_name IN ('Q1','Q2','Q3','Q4')";
+                    $annualForecastParams = [
+                        ':year' => $year,
+                        ':categoryName' => $categoryName
+                    ];
+                    if ($cluster) {
+                        $updateAnnualForecastSumQuery .= " AND b.cluster = :cluster";
+                        $annualForecastParams[':cluster'] = $cluster;
+                    }
+                    $updateAnnualForecastSumQuery .= ") WHERE year2 = :year2 AND category_name = :categoryName2 AND period_name = 'Annual Total'";
+                    $annualForecastParams[':year2'] = $year;
+                    $annualForecastParams[':categoryName2'] = $categoryName;
+                    if ($cluster) {
+                        $updateAnnualForecastSumQuery .= " AND cluster = :cluster2";
+                        $annualForecastParams[':cluster2'] = $cluster;
+                    }
+                    $updateAnnualForecastSumStmt = $conn->prepare($updateAnnualForecastSumQuery);
+                    $updateAnnualForecastSumStmt->execute($annualForecastParams);
+
                     // Update actual_plus_forecast for Annual Total
                     $updateAnnualActualForecastQuery = "UPDATE budget_data 
                         SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
@@ -618,8 +689,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $updateTotalStmt = $conn->prepare($updateTotalQuery);
                     $updateTotalStmt->execute($totalParams);
                     
-                    // Do not auto-update forecast for Total row; keep it manual
-                    
+                    // Sync Total forecast as sum of Annual Total forecasts across categories
+                    $updateTotalForecastSumQuery = "UPDATE budget_data 
+                        SET forecast = (
+                            SELECT SUM(COALESCE(forecast, 0)) FROM budget_data b 
+                            WHERE b.year2 = :year AND b.period_name = 'Annual Total' AND b.category_name != 'Total'";
+                    $totalForecastParams = [
+                        ':year' => $year
+                    ];
+                    if ($cluster) {
+                        $updateTotalForecastSumQuery .= " AND b.cluster = :cluster";
+                        $totalForecastParams[':cluster'] = $cluster;
+                    }
+                    $updateTotalForecastSumQuery .= ") WHERE year2 = :year2 AND category_name = 'Total' AND period_name = 'Total'";
+                    $totalForecastParams[':year2'] = $year;
+                    if ($cluster) {
+                        $updateTotalForecastSumQuery .= " AND cluster = :cluster2";
+                        $totalForecastParams[':cluster2'] = $cluster;
+                    }
+                    $updateTotalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
+                    $updateTotalForecastSumStmt->execute($totalForecastParams);
+
                     // Update actual_plus_forecast for Total row
                     $updateTotalActualForecastQuery = "UPDATE budget_data 
                         SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)

@@ -386,6 +386,7 @@ try {
                 // MySQL evaluates SET clauses left to right, so later expressions see updated column values
                 $updateBudgetQuery = "UPDATE budget_data SET 
                     actual = COALESCE(actual, 0) + ?,
+                    forecast = GREATEST(COALESCE(budget, 0) - COALESCE(actual, 0), 0),
                     actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
                     WHERE year2 = ? AND category_name = ? AND period_name = ?
                     AND ? BETWEEN start_date AND end_date";
@@ -457,6 +458,26 @@ try {
                     
                     // Do not auto-update forecast for Annual Total; forecast remains manual
                     
+                    // Synchronize Annual Total forecast as sum of quarter forecasts with cluster consideration
+                    $updateAnnualForecastSumQuery = "UPDATE budget_data 
+                        SET forecast = (
+                            SELECT COALESCE(SUM(forecast), 0)
+                            FROM budget_data b 
+                            WHERE b.year2 = ? AND b.category_name = ? AND b.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
+                    if ($userCluster) {
+                        $updateAnnualForecastSumQuery .= " AND b.cluster = ?";
+                    }
+                    $updateAnnualForecastSumQuery .= ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
+                    if ($userCluster) {
+                        $updateAnnualForecastSumQuery .= " AND cluster = ?";
+                        $annualForecastSumStmt = $conn->prepare($updateAnnualForecastSumQuery);
+                        $annualForecastSumStmt->bind_param("ississ", $year, $categoryName, $userCluster, $year, $categoryName, $userCluster);
+                    } else {
+                        $annualForecastSumStmt = $conn->prepare($updateAnnualForecastSumQuery);
+                        $annualForecastSumStmt->bind_param("isis", $year, $categoryName, $year, $categoryName);
+                    }
+                    $annualForecastSumStmt->execute();
+
                     // Update actual_plus_forecast for Annual Total with cluster consideration
                     $updateAnnualForecastQuery = "UPDATE budget_data 
                         SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
@@ -521,6 +542,25 @@ try {
                     
                     // Do not auto-update forecast for Total; forecast remains manual
                     
+                    // Synchronize Total forecast as sum of Annual Total forecasts across categories with cluster consideration
+                    $updateTotalForecastSumQuery = "UPDATE budget_data 
+                        SET forecast = (
+                            SELECT COALESCE(SUM(forecast), 0)
+                            FROM budget_data b2 
+                            WHERE b2.year2 = ? AND b2.period_name = 'Annual Total' AND b2.category_name != 'Total'";
+                    if ($userCluster) {
+                        $updateTotalForecastSumQuery .= " AND b2.cluster = ?";
+                    }
+                    $updateTotalForecastSumQuery .= ") WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'";
+                    if ($userCluster) {
+                        $updateTotalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
+                        $updateTotalForecastSumStmt->bind_param("isis", $year, $userCluster, $year, $userCluster);
+                    } else {
+                        $updateTotalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
+                        $updateTotalForecastSumStmt->bind_param("ii", $year, $year);
+                    }
+                    $updateTotalForecastSumStmt->execute();
+
                     // Update actual_plus_forecast for Total with cluster consideration
                     $updateTotalActualForecastQuery = "UPDATE budget_data 
                         SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
@@ -816,10 +856,11 @@ try {
                     throw new Exception("Failed to delete transaction: " . $deleteStmt->error);
                 }
                 
-                // Update the budget_data table to reduce actual spending
+                // Update the budget_data table to reduce actual spending and recalc forecast for the quarter
                 if ($budgetId) {
                     $updateBudgetQuery = "UPDATE budget_data SET 
                         actual = GREATEST(COALESCE(actual, 0) - ?, 0),
+                        forecast = GREATEST(COALESCE(budget, 0) - COALESCE(actual, 0), 0),
                         actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
                         WHERE id = ?";
                     
@@ -865,7 +906,31 @@ try {
                         throw new Exception("Failed to update annual budget data: " . $annualStmt->error);
                     }
                     
-                    // Update the Total row across all categories (do not auto-update forecast)
+                    // Sync Annual Total forecast from quarterly sums (for this category)
+                    $updateAnnualForecastSumQuery = "UPDATE budget_data 
+                        SET forecast = (
+                            SELECT COALESCE(SUM(forecast), 0) 
+                            FROM budget_data b 
+                            WHERE b.year2 = ? AND b.category_name = ? AND b.period_name IN ('Q1','Q2','Q3','Q4')" .
+                        ($userCluster ? " AND b.cluster = ?" : "") .
+                        ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'" .
+                        ($userCluster ? " AND cluster = ?" : "");
+                    if ($userCluster) {
+                        $annualForecastSumStmt = $conn->prepare($updateAnnualForecastSumQuery);
+                        $annualForecastSumStmt->bind_param("ississ", 
+                            $year, $categoryName, $userCluster,
+                            $year, $categoryName, $userCluster);
+                    } else {
+                        $annualForecastSumStmt = $conn->prepare($updateAnnualForecastSumQuery);
+                        $annualForecastSumStmt->bind_param("isis", 
+                            $year, $categoryName,
+                            $year, $categoryName);
+                    }
+                    if (!$annualForecastSumStmt->execute()) {
+                        throw new Exception("Failed to update Annual Total forecast sum: " . $annualForecastSumStmt->error);
+                    }
+
+                    // Update the Total row across all categories (and do not auto-update forecast here)
                     $updateTotalQuery = "UPDATE budget_data 
                         SET budget = (
                             SELECT SUM(COALESCE(budget, 0)) 
@@ -898,6 +963,30 @@ try {
                         throw new Exception("Failed to update total budget data: " . $totalStmt->error);
                     }
                     
+                    // Sync Total forecast as sum of Annual Total forecasts across categories
+                    $updateTotalForecastSumQuery = "UPDATE budget_data 
+                        SET forecast = (
+                            SELECT COALESCE(SUM(forecast), 0)
+                            FROM budget_data b2 
+                            WHERE b2.year2 = ? AND b2.period_name = 'Annual Total' AND b2.category_name != 'Total'" .
+                        ($userCluster ? " AND b2.cluster = ?" : "") .
+                        ") WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'" .
+                        ($userCluster ? " AND cluster = ?" : "");
+                    if ($userCluster) {
+                        $totalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
+                        $totalForecastSumStmt->bind_param("isis", 
+                            $year, $userCluster,
+                            $year, $userCluster);
+                    } else {
+                        $totalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
+                        $totalForecastSumStmt->bind_param("ii", 
+                            $year,
+                            $year);
+                    }
+                    if (!$totalForecastSumStmt->execute()) {
+                        throw new Exception("Failed to update Total forecast sum: " . $totalForecastSumStmt->error);
+                    }
+
                     // Update actual_plus_forecast for Annual Total and Total without altering forecast
                     $updateAnnualAPF = "UPDATE budget_data SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0) WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'" . ($userCluster ? " AND cluster = ?" : "");
                     $annualApfStmt = $conn->prepare($updateAnnualAPF);
