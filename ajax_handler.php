@@ -553,6 +553,8 @@ try {
                     }
                     $updateTotalForecastSumQuery .= ") WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'";
                     if ($userCluster) {
+                        // Ensure outer update also filters by cluster to match bound parameters
+                        $updateTotalForecastSumQuery .= " AND cluster = ?";
                         $updateTotalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
                         $updateTotalForecastSumStmt->bind_param("isis", $year, $userCluster, $year, $userCluster);
                     } else {
