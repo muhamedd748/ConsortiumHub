@@ -153,8 +153,9 @@ if (isset($_GET['id']) && !empty($_GET['id'])) {
 
             // Subtract amount from actual (never go below 0) - this is the rollback
             $newActual = max(0, $currentActual - $amount);
-            // Keep forecast manual; do not auto-recalculate
-            $newActualPlusForecast = $newActual + $currentForecast;
+            // Recalculate forecast to keep Budget = Actual + Forecast
+            $newForecast = max(0, $currentBudget - $newActual);
+            $newActualPlusForecast = $newActual + $newForecast;
             $newVariancePercentage = 0;
             if ($currentBudget > 0) {
                 $newVariancePercentage = round((($currentBudget - $newActualPlusForecast) / $currentBudget) * 100, 2);
@@ -165,6 +166,7 @@ if (isset($_GET['id']) && !empty($_GET['id'])) {
             // Update the specific quarter row
             $updateBudgetQuery = "UPDATE budget_data SET 
                 actual = ?, 
+                forecast = ?, 
                 actual_plus_forecast = ?, 
                 variance_percentage = ? 
                 WHERE id = ?";
@@ -172,7 +174,7 @@ if (isset($_GET['id']) && !empty($_GET['id'])) {
             if (!$updateStmt) {
                 throw new Exception("Update prepare failed: " . $conn->error);
             }
-            $updateStmt->bind_param("dddi", $newActual, $newActualPlusForecast, $newVariancePercentage, $budgetId);
+            $updateStmt->bind_param("ddddi", $newActual, $newForecast, $newActualPlusForecast, $newVariancePercentage, $budgetId);
             if (!$updateStmt->execute()) {
                 throw new Exception("Update execute failed: " . $updateStmt->error);
             }
@@ -210,7 +212,35 @@ if (isset($_GET['id']) && !empty($_GET['id'])) {
                 throw new Exception("Annual actual update failed: " . $updateAnnualStmt->error);
             }
 
-            // ========== UPDATE ANNUAL ACTUAL+FORECAST ONLY (keep forecast manual) ==========
+            // ========== SYNC ANNUAL FORECAST AS SUM OF QUARTERS THEN UPDATE ACTUAL+FORECAST ==========
+            $updateAnnualForecastSumQuery = "UPDATE budget_data SET forecast = (
+                SELECT COALESCE(SUM(forecast), 0) FROM budget_data b 
+                WHERE b.year2 = ? AND b.category_name = ? AND b.period_name IN ('Q1','Q2','Q3','Q4')";
+            $annualSumTypes = "is";
+            $annualSumParams = [$year, $categoryName];
+            if ($cluster) {
+                $updateAnnualForecastSumQuery .= " AND b.cluster = ?";
+                $annualSumTypes .= "s";
+                $annualSumParams[] = $cluster;
+            }
+            $updateAnnualForecastSumQuery .= ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
+            $annualSumTypes .= "is";
+            $annualSumParams[] = $year;
+            $annualSumParams[] = $categoryName;
+            if ($cluster) {
+                $updateAnnualForecastSumQuery .= " AND cluster = ?";
+                $annualSumTypes .= "s";
+                $annualSumParams[] = $cluster;
+            }
+            $updateAnnualForecastSumStmt = $conn->prepare($updateAnnualForecastSumQuery);
+            if (!$updateAnnualForecastSumStmt) {
+                throw new Exception("Annual forecast sum update prepare failed: " . $conn->error);
+            }
+            $updateAnnualForecastSumStmt->bind_param($annualSumTypes, ...$annualSumParams);
+            if (!$updateAnnualForecastSumStmt->execute()) {
+                throw new Exception("Annual forecast sum update failed: " . $updateAnnualForecastSumStmt->error);
+            }
+
             $updateAnnualActualForecastQuery = "UPDATE budget_data SET 
                 actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
                 WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
@@ -287,7 +317,35 @@ if (isset($_GET['id']) && !empty($_GET['id'])) {
                 throw new Exception("Total actual update failed: " . $updateTotalStmt->error);
             }
 
-            // ========== UPDATE ACTUAL+FORECAST FOR TOTAL ROW ONLY (keep forecast manual) ==========
+            // ========== SYNC TOTAL FORECAST AS SUM OF ANNUAL TOTALS THEN UPDATE ACTUAL+FORECAST ==========
+            $updateTotalForecastSumQuery = "UPDATE budget_data SET forecast = (
+                SELECT COALESCE(SUM(forecast), 0) FROM budget_data b 
+                WHERE b.year2 = ? AND b.period_name = 'Annual Total' AND b.category_name != 'Total'";
+            $totalSumTypes = "i";
+            $totalSumParams = [$year];
+            if ($cluster) {
+                $updateTotalForecastSumQuery .= " AND b.cluster = ?";
+                $totalSumTypes .= "s";
+                $totalSumParams[] = $cluster;
+            }
+            $updateTotalForecastSumQuery .= ") WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'";
+            $totalSumTypes .= "i";
+            $totalSumParams[] = $year;
+            if ($cluster) {
+                $updateTotalForecastSumQuery .= " AND cluster = ?";
+                $totalSumTypes .= "s";
+                $totalSumParams[] = $cluster;
+            }
+            $updateTotalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
+            if (!$updateTotalForecastSumStmt) {
+                throw new Exception("Total forecast sum update prepare failed: " . $conn->error);
+            }
+            $updateTotalForecastSumStmt->bind_param($totalSumTypes, ...$totalSumParams);
+            if (!$updateTotalForecastSumStmt->execute()) {
+                throw new Exception("Total forecast sum update failed: " . $updateTotalForecastSumStmt->error);
+            }
+
+            // ========== UPDATE ACTUAL+FORECAST FOR TOTAL ROW ==========
             $updateTotalActualForecastQuery = "UPDATE budget_data 
                 SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
                 WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'";
