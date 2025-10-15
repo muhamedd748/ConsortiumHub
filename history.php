@@ -220,7 +220,7 @@ while ($row = $transactionsResult->fetch_assoc()) {
     $totalForecast += $forecastETB;
 }
 $totalActualPlusForecast = $totalActual + $totalForecast;
-$totalVariance = $totalBudget > 0 ? (($totalActual - $totalBudget) / $totalBudget * 100) : 0;
+$totalVariance = $totalBudget > 0 ? ((($totalActual + $totalForecast) - $totalBudget) / abs($totalBudget) * 100) : 0;
 
 // Get summary data for the year
 $summaryQuery = "SELECT 
