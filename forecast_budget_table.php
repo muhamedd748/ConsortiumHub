@@ -303,7 +303,8 @@ foreach ($section2Data as $categoryName => &$periods) {
         }
         
         // Append calculated Annual Total row with correct variance calculation
-        $annualVariance = ($annualBudget != 0) ? round((($annualBudget - $annualActualPlusForecast) / abs($annualBudget)) * 100, 2) : 0;
+        // Variance = ((Actual + Forecast - Budget) / Budget) * 100
+        $annualVariance = ($annualBudget != 0) ? round((($annualActualPlusForecast - $annualBudget) / abs($annualBudget)) * 100, 2) : 0;
         $periods[] = [
             'category_name' => $categoryName,
             'period_name' => 'Annual Total',
@@ -607,7 +608,8 @@ foreach ($section3Categories as $categoryName => $quarters) {
         }
     }
 
-    $variance = ($annualBudget != 0) ? round((($annualBudget - $annualActualPlusForecast) / abs($annualBudget)) * 100, 2) : 0;
+    // Variance = ((Actual + Forecast - Budget) / Budget) * 100
+    $variance = ($annualBudget != 0) ? round((($annualActualPlusForecast - $annualBudget) / abs($annualBudget)) * 100, 2) : 0;
     $recomputedCategoryTotals[$categoryName]['Annual Total'] = [
         'category_name' => $categoryName,
         'period_name' => 'Annual Total',
@@ -627,7 +629,8 @@ foreach ($recomputedCategoryTotals as $cat => $totals) {
     $grandBudget += floatval($totals['Annual Total']['budget'] ?? 0);
     $grandActualPlusForecast += floatval($totals['Annual Total']['actual_plus_forecast'] ?? 0);
 }
-$grandVariance = ($grandBudget != 0) ? round((($grandBudget - $grandActualPlusForecast) / abs($grandBudget)) * 100, 2) : 0;
+// Variance = ((Actual + Forecast - Budget) / Budget) * 100
+$grandVariance = ($grandBudget != 0) ? round((($grandActualPlusForecast - $grandBudget) / abs($grandBudget)) * 100, 2) : 0;
 
 // Overwrite categoryTotals to use recomputed values and add Grand Total
 $categoryTotals = $recomputedCategoryTotals;
@@ -1703,7 +1706,7 @@ if (!$included):
                 echo '<td>' . formatCurrency($grandTotalCalculated['actual'], $selectedCurrency) . '</td>';
                 echo '<td>' . formatCurrency($grandTotalCalculated['forecast'], $selectedCurrency) . '</td>';
                 echo '<td>' . formatCurrency($grandTotalCalculated['actual_plus_forecast'], $selectedCurrency) . '</td>';
-                $grandTotalVariance = ($grandTotalCalculated['budget'] != 0) ? round((($grandTotalCalculated['budget'] - $grandTotalCalculated['actual_plus_forecast']) / abs($grandTotalCalculated['budget'])) * 100, 2) : 0;
+                $grandTotalVariance = ($grandTotalCalculated['budget'] != 0) ? round((($grandTotalCalculated['actual_plus_forecast'] - $grandTotalCalculated['budget']) / abs($grandTotalCalculated['budget'])) * 100, 2) : 0;
                 $varianceClass = $grandTotalVariance > 0 ? 'variance-positive' : ($grandTotalVariance < 0 ? 'variance-negative' : 'variance-zero');
                 echo '<td class="' . $varianceClass . '">' . $grandTotalVariance . '%</td>';
                 echo '</tr>';
@@ -1743,7 +1746,7 @@ if (!$included):
                     $annualActualForecast += floatval($row['actual_plus_forecast'] ?? 0);
                   }
                 }
-                $annualVariance = ($annualBudget != 0) ? round((($annualBudget - $annualActualForecast) / abs($annualBudget)) * 100, 2) : 0;
+                $annualVariance = ($annualBudget != 0) ? round((($annualActualForecast - $annualBudget) / abs($annualBudget)) * 100, 2) : 0;
 
                 // Display each period
                 foreach ($orderedPeriods as $row):
@@ -2866,7 +2869,7 @@ document.addEventListener('DOMContentLoaded', function() {
         // Calculate variance based on annual totals
         let variance = 0;
         if (annualBudgetTotal != 0) {
-          variance = ((annualBudgetTotal - actualForecastTotal) / Math.abs(annualBudgetTotal)) * 100;
+          variance = ((actualForecastTotal - annualBudgetTotal) / Math.abs(annualBudgetTotal)) * 100;
         }
 
         // Determine variance class based on global financial standards
@@ -2956,7 +2959,7 @@ document.addEventListener('DOMContentLoaded', function() {
         // Calculate variance
         let variance = 0;
         if (grandBudget != 0) {
-          variance = ((grandBudget - grandActualForecast) / Math.abs(grandBudget)) * 100;
+          variance = ((grandActualForecast - grandBudget) / Math.abs(grandBudget)) * 100;
         }
         let varianceClass = 'variance-zero';
         if (variance > 0) varianceClass = 'variance-positive';
@@ -3011,7 +3014,7 @@ document.addEventListener('DOMContentLoaded', function() {
       // Calculate variance
       let variance = 0;
       if (totals.annualBudget !== 0) {
-        variance = ((totals.annualBudget - totals.actualForecast) / Math.abs(totals.annualBudget)) * 100;
+        variance = ((totals.actualForecast - totals.annualBudget) / Math.abs(totals.annualBudget)) * 100;
       }
       return [
         'Grand Total',
@@ -3135,7 +3138,7 @@ document.addEventListener('DOMContentLoaded', function() {
       // Calculate variance
       let variance = 0;
       if (annualBudget !== 0) {
-        variance = ((annualBudget - actualForecast) / Math.abs(annualBudget)) * 100;
+        variance = ((actualForecast - annualBudget) / Math.abs(annualBudget)) * 100;
       }
       let varianceClass = 'variance-zero';
       if (variance > 0) varianceClass = 'variance-positive';

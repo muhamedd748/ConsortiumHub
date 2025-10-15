@@ -226,12 +226,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $newActualPlusForecast = $newActual + $newForecast;
             
             // Calculate new variance percentage using the correct formula
-            // Variance = ((Budget - (Actual + Forecast)) / Budget) * 100
+            // Variance = ((Actual + Forecast - Budget) / Budget) * 100
             $newVariancePercentage = 0;
             if ($currentBudget > 0) {
-                $newVariancePercentage = round((($currentBudget - $newActualPlusForecast) / $currentBudget) * 100, 2);
+                $newVariancePercentage = round((($newActualPlusForecast - $currentBudget) / abs($currentBudget)) * 100, 2);
             } else if ($currentBudget == 0 && $newActualPlusForecast > 0) {
-                $newVariancePercentage = -100.00;
+                $newVariancePercentage = 100.00;
             }
             
             // Update the specific quarter row in budget_data including recalculated forecast
@@ -332,8 +332,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // Update variance percentages
                 $updateVarianceQuery = "UPDATE budget_data 
                     SET variance_percentage = CASE 
-                        WHEN budget > 0 THEN ROUND(((budget - (COALESCE(actual,0) + COALESCE(forecast,0))) / budget) * 100, 2)
-                        WHEN budget = 0 AND (COALESCE(actual,0) + COALESCE(forecast,0)) > 0 THEN -100.00
+                        WHEN budget > 0 THEN ROUND((((COALESCE(actual,0) + COALESCE(forecast,0)) - budget) / ABS(budget)) * 100, 2)
+                        WHEN budget = 0 AND (COALESCE(actual,0) + COALESCE(forecast,0)) > 0 THEN 100.00
                         ELSE 0.00 
                     END
                     WHERE year2 = :year AND category_name = :categoryName";
@@ -418,8 +418,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // Update variance for Total row
                 $updateTotalVarianceQuery = "UPDATE budget_data 
                     SET variance_percentage = CASE 
-                        WHEN budget > 0 THEN ROUND(((budget - (COALESCE(actual,0) + COALESCE(forecast,0))) / budget) * 100, 2)
-                        WHEN budget = 0 AND (COALESCE(actual,0) + COALESCE(forecast,0)) > 0 THEN -100.00
+                        WHEN budget > 0 THEN ROUND((((COALESCE(actual,0) + COALESCE(forecast,0)) - budget) / ABS(budget)) * 100, 2)
+                        WHEN budget = 0 AND (COALESCE(actual,0) + COALESCE(forecast,0)) > 0 THEN 100.00
                         ELSE 0.00 
                     END
                     WHERE year2 = :year AND category_name = 'Total' AND period_name = 'Total'";
@@ -537,12 +537,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $newActualPlusForecast = $newActual + $newForecast;
                 
                 // Calculate new variance percentage using the correct formula
-                // Variance = ((Budget - (Actual + Forecast)) / Budget) * 100
+                // Variance = ((Actual + Forecast - Budget) / Budget) * 100
                 $newVariancePercentage = 0;
                 if ($currentBudget > 0) {
-                    $newVariancePercentage = round((($currentBudget - $newActualPlusForecast) / $currentBudget) * 100, 2);
+                    $newVariancePercentage = round((($newActualPlusForecast - $currentBudget) / abs($currentBudget)) * 100, 2);
                 } else if ($currentBudget == 0 && $newActualPlusForecast > 0) {
-                    $newVariancePercentage = -100.00;
+                    $newVariancePercentage = 100.00;
                 }
                 
                 // Update the specific quarter row in budget_data including recalculated forecast
@@ -644,8 +644,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     // Update variance percentages
                     $updateVarianceQuery = "UPDATE budget_data 
                         SET variance_percentage = CASE 
-                            WHEN budget > 0 THEN ROUND(((budget - (COALESCE(actual,0) + COALESCE(forecast,0))) / budget) * 100, 2)
-                            WHEN budget = 0 AND (COALESCE(actual,0) + COALESCE(forecast,0)) > 0 THEN -100.00
+                            WHEN budget > 0 THEN ROUND((((COALESCE(actual,0) + COALESCE(forecast,0)) - budget) / ABS(budget)) * 100, 2)
+                            WHEN budget = 0 AND (COALESCE(actual,0) + COALESCE(forecast,0)) > 0 THEN 100.00
                             ELSE 0.00 
                         END
                         WHERE year2 = :year AND category_name = :categoryName";
@@ -730,8 +730,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     // Update variance for Total row
                     $updateTotalVarianceQuery = "UPDATE budget_data 
                         SET variance_percentage = CASE 
-                            WHEN budget > 0 THEN ROUND(((budget - (COALESCE(actual,0) + COALESCE(forecast,0))) / budget) * 100, 2)
-                            WHEN budget = 0 AND (COALESCE(actual,0) + COALESCE(forecast,0)) > 0 THEN -100.00
+                            WHEN budget > 0 THEN ROUND((((COALESCE(actual,0) + COALESCE(forecast,0)) - budget) / ABS(budget)) * 100, 2)
+                            WHEN budget = 0 AND (COALESCE(actual,0) + COALESCE(forecast,0)) > 0 THEN 100.00
                             ELSE 0.00 
                         END
                         WHERE year2 = :year AND category_name = 'Total' AND period_name = 'Total'";

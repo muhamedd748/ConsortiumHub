@@ -702,11 +702,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                                 $quarterForecastStmt->execute();
                                 
                                 // Calculate and update variance percentages for all rows with cluster consideration
-                                // Variance = ((Budget - (Actual + Forecast)) / Budget) * 100
+                                // Variance = ((Actual + Forecast - Budget) / Budget) * 100
                                 $varianceQuery = "UPDATE budget_data 
                                     SET variance_percentage = CASE 
-                                        WHEN budget > 0 THEN ROUND(((budget - (COALESCE(actual,0) + COALESCE(forecast,0))) / budget) * 100, 2)
-                                        WHEN budget = 0 AND (COALESCE(actual,0) + COALESCE(forecast,0)) > 0 THEN -100.00
+                                        WHEN budget > 0 THEN ROUND((((COALESCE(actual,0) + COALESCE(forecast,0)) - budget) / ABS(budget)) * 100, 2)
+                                        WHEN budget = 0 AND (COALESCE(actual,0) + COALESCE(forecast,0)) > 0 THEN 100.00
                                         ELSE 0.00 
                                     END
                                     WHERE year2 = ?";
